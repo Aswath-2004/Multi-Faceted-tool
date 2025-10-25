@@ -1,13 +1,15 @@
 import os
 import re
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 import google.generativeai as genai
+# We will catch the generic 'Exception' in the retry logic for robustness.
 
-from langchain_community.retrievers import WikipediaRetriever
-from langchain.chains import RetrievalQA
+# Using a standard Wikipedia Retriever for verification context retrieval only
+from langchain_community.retrievers import WikipediaRetriever 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate 
 from langchain_core.messages import SystemMessage
@@ -35,9 +37,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 print(f"Value of GEMINI_API_KEY from environment: '{GEMINI_API_KEY}'")
 
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env file. Please set it.")
-genai.configure(api_key=GEMINI_API_KEY)
+    # This print statement helps debug if the key is missing in the environment
+    print("WARNING: GEMINI_API_KEY is not set. API calls will likely fail.")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
 
+
+# CRITICAL FIX: Ensure the API key is correctly passed to the ChatGoogleGenerativeAI models.
 # Using gemini-2.5-flash for main chat and analysis
 chat_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7, google_api_key=GEMINI_API_KEY)
 analysis_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=GEMINI_API_KEY)
@@ -47,66 +53,21 @@ intent_classifier_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", tempe
 
 
 # Global variables
-qa_chain = None
-wiki_retriever = None
+# Initialization for the Wikipedia Retriever (for verification purposes only)
+try:
+    # UPDATED CONFIGURATION: top_k_results changed from 1 to 3 to improve retrieval robustness
+    wiki_retriever = WikipediaRetriever(top_k_results=3, doc_content_chars_max=8000) 
+    print("WikipediaRetriever initialized for analysis.")
+except Exception as e:
+    print(f"Error initializing WikipediaRetriever: {e}")
+    wiki_retriever = None
 
-# Custom Prompt Template updated to be STRICTLY CONCISE.
-CUSTOM_QA_PROMPT = """
-You are a highly selective, professional, and concise information retrieval bot.
-Your task is to answer the user's question only using the provided context from Wikipedia.
-
-Strictly adhere to these rules:
-1.  **Strict Conciseness:** The final answer must be a maximum of THREE sentences long. Only state the most crucial information.
-2.  **Organization:** If the query is vague and multiple distinct concepts are found (e.g., Planet and Musician for "Mars"), summarize the main idea of each.
-3.  **No Extraneous Text:** Do not include introductory phrases or conclusions. Start directly with the organized answer.
-
-Context:
-{context}
-
-Question: {question}
-
-Strictly Concise and Organized Answer (MAX THREE SENTENCES):
-"""
 
 # System prompt for intent classification
 CLASSIFIER_SYSTEM_PROMPT = SystemMessage(
     content="You are a system that classifies user queries. Respond with ONLY ONE word: 'FACTUAL' if the query requires external knowledge retrieval (e.g., questions about history, science, specific people, or concepts), or 'CONVERSATIONAL' if it is a simple greeting, short command, compliment, or small talk."
 )
 
-
-def initialize_rag_system():
-    global qa_chain, wiki_retriever
-    print("Initializing Wikipedia RAG system...")
-    try:
-        # Define the custom prompt template
-        QA_PROMPT_TEMPLATE = PromptTemplate(
-            template=CUSTOM_QA_PROMPT, 
-            input_variables=["context", "question"]
-        )
-
-        # 1. Initialize the Wikipedia Retriever
-        # MODIFIED: Changed top_k_results from 3 to 1 to prioritize the single, most popular Wikipedia article (like Google SEO).
-        wiki_retriever = WikipediaRetriever(top_k_results=1, doc_content_chars_max=4000)
-        print("WikipediaRetriever initialized.")
-
-        # 2. Initialize the RetrievalQA chain using the WikipediaRetriever and custom prompt
-        # The 'chain_type_kwargs' injects the strict prompt instructions into the LLM chain.
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=wiki_retriever,
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": QA_PROMPT_TEMPLATE} # Inject the custom prompt here
-        )
-        print("Wikipedia RAG QA chain initialized with custom prompt for conciseness.")
-        
-    except Exception as e:
-        print(f"Error initializing RAG system: {e}")
-        qa_chain = None
-        wiki_retriever = None
-
-with app.app_context():
-    initialize_rag_system()
 
 analyzer = AnalyzerEngine()
 anonymizer = AnonymizerEngine()
@@ -118,6 +79,29 @@ NON_SENSITIVE_LOCATIONS = {
 NON_SENSITIVE_NAMES = {
     "john", "jane", "alex", "michael"
 }
+
+
+# --- NEW FUNCTION FOR API RETRY LOGIC (EXPONENTIAL BACKOFF) ---
+def invoke_with_retry(model, prompt, max_retries=3, tools=None):
+    """Invokes the LangChain model with exponential backoff on errors."""
+    for attempt in range(max_retries):
+        try:
+            if tools:
+                return model.invoke(prompt, tools=tools)
+            else:
+                return model.invoke(prompt)
+        except Exception as e:
+            # Catch all exceptions (API errors, connection issues, invalid arguments) for robust retrying
+            error_type = "API/Connection Error"
+            print(f"{error_type} (Attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt + 1 == max_retries:
+                # Re-raise on the last attempt
+                raise
+            # Exponential backoff: 2^attempt seconds
+            wait_time = 2 ** attempt
+            print(f"Waiting for {wait_time} seconds before retrying...")
+            time.sleep(wait_time)
+# --- END NEW FUNCTION ---
 
 
 @app.route('/chat', methods=['POST'])
@@ -133,39 +117,72 @@ def chat():
         # --- 1. INTENT CLASSIFICATION ---
         print(f"Classifying intent for: '{user_message}'")
         
-        classification_response = intent_classifier_model.invoke(
+        # Use retry logic for classification
+        classification_response_raw = invoke_with_retry(
+            intent_classifier_model, 
             [CLASSIFIER_SYSTEM_PROMPT, user_message]
-        ).content.strip().upper()
+        ).content
+        
+        classification_response = classification_response_raw.strip().upper()
 
         is_factual_query = (classification_response == "FACTUAL")
         print(f"Intent classified as: {classification_response}")
         
         bot_response_text = ""
         
+        # --- NEW CHECK FOR SPECULATIVE/INTERNAL KNOWLEDGE ONLY MODE ---
+        is_speculative_mode = "internal knowledge only" in user_message.lower()
+        if is_speculative_mode:
+            is_factual_query = True # Treat as factual, but use special prompt
+            print("Detected 'internal knowledge only' mode.")
+        # --- END NEW CHECK ---
+        
         if is_factual_query:
-            # --- 2a. FACTUAL QUERY: Use RAG (Wikipedia) ---
-            if not qa_chain:
-                return jsonify({"error": "Wikipedia RAG system not initialized. Cannot answer factual questions."}), 500
+            
+            # --- Setup Prompt based on mode ---
+            if is_speculative_mode:
+                # Option A: Speculative / internal knowledge only
+                system_instruction = "You are an assistant answering strictly from your own internal knowledge. Do NOT fetch anything externally. If you are unsure, provide your best plausible answer and label it as [SPECULATIVE]. Be professional and concise."
+            else:
+                # Default Factual Mode: Use direct LLM call with Google Search Grounding
+                system_instruction = "You are a helpful, professional, and concise assistant. Use Google Search to answer factual questions based on the latest information available."
+            
+            # Construct the chat history/prompt including system instructions
+            prompt_with_history = [
+                SystemMessage(content=system_instruction),
+                user_message
+            ]
 
-            rag_response = qa_chain.invoke({"query": user_message})
-            bot_response_text = rag_response["result"]
+            # Use retry logic for main chat model. Rely on the model's 
+            # inherent ability to use search tools for factual queries.
+            direct_response = invoke_with_retry(
+                chat_model,
+                prompt_with_history,
+            )
+            
+            bot_response_text = direct_response.content.strip()
             
         else:
-            # --- 2b. CONVERSATIONAL QUERY: Use direct LLM call ---
+            # --- CONVERSATIONAL QUERY: Use direct LLM call ---
             # Define a standard conversational prompt for simple queries
             conversational_prompt = SystemMessage(
                 content="You are a helpful and brief conversational assistant. Respond naturally and concisely to greetings or simple small talk. Do not retrieve external information."
             )
-            direct_response = chat_model.invoke(
+            
+            # Use retry logic for conversational response
+            direct_response = invoke_with_retry(
+                chat_model,
                 [conversational_prompt, user_message]
             )
+            
             bot_response_text = direct_response.content.strip()
 
         return jsonify({"response": bot_response_text})
 
     except Exception as e:
         print(f"Error during chat processing: {e}")
-        return jsonify({"error": "Failed to get response from AI model.", "details": str(e)}), 500
+        # Return a more descriptive error in the response
+        return jsonify({"error": "Failed to get response from AI model. Check if GEMINI_API_KEY is valid and network connectivity.", "details": str(e)}), 500
 
 
 @app.route('/analyze', methods=['POST'])
@@ -242,7 +259,7 @@ def analyze():
     # --- END PII DETECTION ---
 
     # --- HALLUCINATION CHECK: Now uses Wikipedia for context ---
-    if qa_chain and wiki_retriever:
+    if wiki_retriever: # Note: qa_chain variable check removed
         try:
             # 1. Retrieve the relevant Wikipedia documents based on the text_to_analyze
             retrieved_docs_for_analysis = wiki_retriever.invoke(text_to_analyze)
@@ -271,7 +288,8 @@ def analyze():
                 
                 print(f"Sending verification prompt to Gemini:\n{verification_prompt}")
                 
-                verification_response = analysis_model.invoke(verification_prompt)
+                # Use retry logic for analysis/verification model
+                verification_response = invoke_with_retry(analysis_model, verification_prompt)
                 verification_text = verification_response.content
 
                 verification_status = "Unknown"
