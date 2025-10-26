@@ -10,10 +10,11 @@ import google.generativeai as genai
 
 # Using a standard Wikipedia Retriever for verification context retrieval only
 from langchain_community.retrievers import WikipediaRetriever 
+# NEW: Import PubMedRetriever for scientific verification
+from langchain_community.retrievers import PubMedRetriever
 # NEW: Import Google Search API Wrapper
 from langchain_community.utilities import GoogleSearchAPIWrapper
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate 
 from langchain_core.messages import SystemMessage
 
 from presidio_analyzer import AnalyzerEngine
@@ -54,6 +55,9 @@ else:
 # CRITICAL FIX: Ensure the API key is correctly passed to the ChatGoogleGenerativeAI models.
 # Using gemini-2.5-flash for main chat and analysis
 chat_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7, google_api_key=GEMINI_API_KEY)
+# We use a *higher* temperature for the correction model to allow better synthesis
+correction_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, google_api_key=GEMINI_API_KEY)
+# The analysis model remains low-temp for reliability in RAG processing
 analysis_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=GEMINI_API_KEY)
 
 # A separate model instance for quick intent classification (low temperature for reliability)
@@ -69,6 +73,14 @@ try:
 except Exception as e:
     print(f"Error initializing WikipediaRetriever: {e}")
     wiki_retriever = None
+
+# NEW: Initialization for PubMed Retriever
+try:
+    pubmed_retriever = PubMedRetriever(top_k_results=3, doc_content_chars_max=8000) 
+    print("PubMedRetriever initialized for scientific analysis.")
+except Exception as e:
+    print(f"Error initializing PubMedRetriever: {e}")
+    pubmed_retriever = None
 
 # NEW: Initialization for Google Search Retriever
 try:
@@ -279,128 +291,172 @@ def analyze():
         analysis_results["pii_info"]["details"].append({"message": "No PII (only Phone Numbers checked) detected."})
     # --- END PII DETECTION ---
 
-    # --- HALLUCINATION CHECK: Now uses Wikipedia and Google Search for context ---
-    if wiki_retriever or search_wrapper:
+    # --- HALLUCINATION CHECK: Three-tiered verification for context ---
+    
+    # 1. Start RAG process
+    search_query = original_user_query 
+    context_parts = []
+    
+    # Fetch Google Search context FIRST (most robust, provides snippets)
+    if search_wrapper:
+        print("Fetching context from Google Search...")
+        search_results = search_wrapper.results(search_query, 3) 
+        
+        found_wiki_snippet = False
+        search_context = []
+        for res in search_results:
+            snippet = res.get('snippet', 'N/A')
+            title = res.get('title', 'N/A')
+            source = res.get('source', '')
+            search_context.append(f"Source: {title} ({source})\nSnippet: {snippet}")
+            
+            if 'wikipedia.org' in source.lower():
+                found_wiki_snippet = True
+                
+        if search_context:
+            context_parts.append(f"--- GOOGLE SEARCH CONTEXT ---\n" + "\n".join(search_context))
+
+    
+    # Fetch Wikipedia context: ONLY RUN if Google didn't give us a direct Wikipedia snippet
+    if wiki_retriever and not found_wiki_snippet: 
+        print("Fetching context from Wikipedia (Fallback)...")
         try:
-            # 1. Generate an effective search query: USE ONLY THE ORIGINAL USER QUERY
-            # This is the most reliable method for specific facts.
-            search_query = original_user_query 
+            retrieved_wiki_docs = wiki_retriever.invoke(search_query)
+            wiki_context = "\n".join([doc.page_content for doc in retrieved_wiki_docs])
+            if wiki_context:
+                context_parts.append(f"--- WIKIPEDIA CONTEXT ---\n{wiki_context}")
+        except Exception as e:
+            print(f"Error during Wikipedia retrieval: {e}")
+
+    # Fetch PubMed context
+    if pubmed_retriever:
+        print("Fetching context from PubMed...")
+        try:
+            retrieved_pubmed_docs = pubmed_retriever.invoke(search_query)
+            pubmed_context = "\n".join([f"Title: {doc.metadata.get('Title', 'N/A')}\nAbstract: {doc.page_content}" for doc in retrieved_pubmed_docs])
+            if pubmed_context:
+                context_parts.append(f"--- PUBMED CONTEXT ---\n{pubmed_context}")
+        except Exception as e:
+            print(f"Error during PubMed retrieval: {e}")
             
-            context_parts = []
+    
+    context_for_verification = "\n\n".join(context_parts)
+    
+    # --- 2. Verification Logic ---
+    if not context_for_verification.strip():
+        # Fallback 1: If RAG provides NO context, use the LLM's native Google Search tool for a definitive answer.
+        print("RAG failed to find context. Invoking LLM Search Grounding for correction...")
+        
+        # System instruction to force the LLM to search for the corrected information
+        correction_prompt = SystemMessage(
+            content=f"The statement to be verified is: '{text_to_analyze}'. The RAG system found no context. Use Google Search to find the most accurate factual correction or replacement statement for this topic. Respond ONLY with the corrected statement."
+        )
+        
+        # Use retry logic with the correction model and tools enabled
+        try:
+            native_search_response = invoke_with_retry(
+                correction_model,
+                [correction_prompt],
+                tools=[{"google_search": {}}]
+            ).content.strip()
+
+            analysis_results["hallucination_info"]["detected"] = True
+            analysis_results["hallucination_info"]["reason"] = "RAG context failure detected. Correction provided via internal LLM search tool for robustness."
+            analysis_results["hallucination_info"]["correction"] = native_search_response
             
-            # Fetch Google Search context FIRST, as it is more robust for general queries
-            if search_wrapper:
-                print("Fetching context from Google Search...")
-                search_results = search_wrapper.results(search_query, 3) 
+        except Exception as e:
+             # If the LLM search tool also fails
+            analysis_results["hallucination_info"]["detected"] = True
+            analysis_results["hallucination_info"]["reason"] = "Verification system failure: Both RAG and LLM Search failed to retrieve context. Cannot definitively verify."
+            analysis_results["hallucination_info"]["correction"] = "Final system error: Cannot provide a definitive correction."
+
+
+    else:
+        # Fallback 2: If RAG HAS context, proceed with standard verification
+        verification_prompt = f"""
+        Given the following factual context retrieved from multiple sources (Wikipedia, Google Search, PubMed):
+        ---
+        {context_for_verification}
+        ---
+        Evaluate the following statement: "{text_to_analyze}"
+        Does this statement align with, contradict, or is it not mentioned in the provided context?
+        If it contradicts or is not mentioned, explain why. If it is Contradicted, or Not Mentioned but likely false, provide the most plausible correction from the provided context or state that a correction cannot be given.
+        Provide your answer in a structured format:
+        Verification: [Supported/Contradicted/Not Mentioned]
+        Reasoning: [Explanation]
+        Correction/Refinement: [Corrected statement if applicable, or 'N/A']
+        """
+        
+        print(f"Sending verification prompt to Gemini:\n{verification_prompt}")
+        
+        try:
+            # Use retry logic for analysis/verification model
+            verification_response = invoke_with_retry(analysis_model, verification_prompt)
+            verification_text = verification_response.content
+
+            verification_status = "Unknown"
+            reasoning = "N/A"
+            correction = "N/A"
+
+            # Use re.DOTALL to ensure multiline match if Gemini's response spans multiple lines
+            if "Verification: Supported" in verification_text:
+                verification_status = "Supported"
+            elif "Verification: Contradicted" in verification_text:
+                verification_status = "Contradicted"
+            elif "Verification: Not Mentioned" in verification_text:
+                verification_status = "Not Mentioned"
+            
+            # Extract Reasoning (single line)
+            reasoning_match = re.search(r"Reasoning: (.+)", verification_text)
+            if reasoning_match:
+                reasoning = reasoning_match.group(1).strip()
+            
+            # Extract Correction/Refinement (potentially multi-line)
+            correction_match = re.search(r"Correction/Refinement: (.+)", verification_text, re.DOTALL)
+            if correction_match:
+                correction = correction_match.group(1).strip()
+
+
+            # Handle logic for setting final results
+            analysis_results["hallucination_info"]["detected"] = (verification_status == "Contradicted" or verification_status == "Not Mentioned")
+            
+            if analysis_results["hallucination_info"]["detected"]:
+                analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
                 
-                # Check if Google Search found a strong Wikipedia result (the 'source' field in search_results is not standardized, but we can look for "wikipedia.org" in the snippet/title)
-                found_wiki_snippet = False
-                search_context = []
-                for res in search_results:
-                    # Append the search result snippet
-                    snippet = res.get('snippet', 'N/A')
-                    title = res.get('title', 'N/A')
-                    source = res.get('source', '')
-                    search_context.append(f"Source: {title} ({source})\nSnippet: {snippet}")
+                # If Gemini provided a correction, use it.
+                if correction != 'N/A':
+                    analysis_results["hallucination_info"]["correction"] = correction
+                
+                # --- CRITICAL FIX: IF CONTRADICTED BUT NO CORRECTION, FORCE NATIVE SEARCH ---
+                elif verification_status == "Contradicted":
+                    print("Contradiction detected but no structured correction found. Forcing native LLM search correction.")
                     
-                    # Check if the result points clearly to a Wikipedia page
-                    if 'wikipedia.org' in source.lower():
-                        found_wiki_snippet = True
+                    # System instruction to force the LLM to search for the corrected information
+                    correction_prompt_contradicted = SystemMessage(
+                        content=f"The RAG system confirmed the statement to be verified ('{text_to_analyze}') is CONTRADICTED by the context. Find the single most accurate factual replacement or correction for this statement using Google Search. Respond ONLY with the corrected statement."
+                    )
+                    
+                    try:
+                        forced_correction = invoke_with_retry(
+                            correction_model,
+                            [correction_prompt_contradicted],
+                            tools=[{"google_search": {}}]
+                        ).content.strip()
+                        analysis_results["hallucination_info"]["correction"] = forced_correction
+                    except Exception:
+                        analysis_results["hallucination_info"]["correction"] = "Cannot provide a definitive correction without more context."
                         
-                if search_context:
-                    context_parts.append(f"--- GOOGLE SEARCH CONTEXT ---\n" + "\n".join(search_context))
+                # If status is Not Mentioned, assume the statement is correct but unverified by RAG (e.g., future events) and set correction to original text for demonstration.
+                elif verification_status == "Not Mentioned":
+                        analysis_results["hallucination_info"]["correction"] = text_to_analyze
 
-            
-            # Fetch Wikipedia context: ONLY RUN if Google didn't give us a direct Wikipedia snippet
-            if wiki_retriever and not found_wiki_snippet: # ADDED check for found_wiki_snippet
-                print("Fetching context from Wikipedia (Fallback)...")
-                retrieved_wiki_docs = wiki_retriever.invoke(search_query)
-                wiki_context = "\n".join([doc.page_content for doc in retrieved_wiki_docs])
-                if wiki_context:
-                    context_parts.append(f"--- WIKIPEDIA CONTEXT ---\n{wiki_context}")
-            
-            # If Google *did* give a Wikipedia snippet, we rely on that to prevent the separate Wikipedia RAG call from failing.
-
-            context_for_verification = "\n\n".join(context_parts)
-            
-            if not context_for_verification.strip():
-                # ENHANCEMENT: Improved message for irrelevant/unverifiable content
-                analysis_results["hallucination_info"]["detected"] = True
-                analysis_results["hallucination_info"]["reason"] = "Unverifiable Factual Claim: No relevant external context (Wikipedia or Google Search) was found for verification. This may be due to the information being too obscure or a complete hallucination."
-                analysis_results["hallucination_info"]["correction"] = "No external context was found to support this claim."
-            else:
-                # 2. Use the retrieved context to ask Gemini for verification
-                verification_prompt = f"""
-                Given the following factual context retrieved from multiple sources (Wikipedia, Google Search):
-                ---
-                {context_for_verification}
-                ---
-                Evaluate the following statement: "{text_to_analyze}"
-                Does this statement align with, contradict, or is it not mentioned in the provided context?
-                If it contradicts or is not mentioned, explain why. If it is Contradicted, or Not Mentioned but likely false, provide the most plausible correction from the provided context or state that a correction cannot be given.
-                Provide your answer in a structured format:
-                Verification: [Supported/Contradicted/Not Mentioned]
-                Reasoning: [Explanation]
-                Correction/Refinement: [Corrected statement if applicable, or 'N/A']
-                """
-                
-                print(f"Sending verification prompt to Gemini:\n{verification_prompt}")
-                
-                # Use retry logic for analysis/verification model
-                verification_response = invoke_with_retry(analysis_model, verification_prompt)
-                verification_text = verification_response.content
-
-                verification_status = "Unknown"
-                reasoning = "N/A"
-                correction = "N/A"
-
-                # Use re.DOTALL to ensure multiline match if Gemini's response spans multiple lines
-                if "Verification: Supported" in verification_text:
-                    verification_status = "Supported"
-                elif "Verification: Contradicted" in verification_text:
-                    verification_status = "Contradicted"
-                elif "Verification: Not Mentioned" in verification_text:
-                    verification_status = "Not Mentioned"
-                
-                # Extract Reasoning (single line)
-                reasoning_match = re.search(r"Reasoning: (.+)", verification_text)
-                if reasoning_match:
-                    reasoning = reasoning_match.group(1).strip()
-                
-                # Extract Correction/Refinement (potentially multi-line)
-                correction_match = re.search(r"Correction/Refinement: (.+)", verification_text, re.DOTALL)
-                if correction_match:
-                    correction = correction_match.group(1).strip()
-
-
-                # Handle logic for setting final results
-                analysis_results["hallucination_info"]["detected"] = (verification_status == "Contradicted" or verification_status == "Not Mentioned")
-                
-                if analysis_results["hallucination_info"]["detected"]:
-                    analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
-                    
-                    # If Gemini provided a correction, use it.
-                    if correction != 'N/A':
-                        analysis_results["hallucination_info"]["correction"] = correction
-                    
-                    # If status is Contradicted but no correction, use generic message.
-                    elif verification_status == "Contradicted":
-                         analysis_results["hallucination_info"]["correction"] = "Cannot provide a definitive correction without more context."
-                         
-                    # If status is Not Mentioned, assume the statement is correct but unverified by RAG (e.g., future events) and set correction to original text for demonstration.
-                    elif verification_status == "Not Mentioned":
-                         analysis_results["hallucination_info"]["correction"] = text_to_analyze
-
-                else: # Supported
-                    analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
-                    analysis_results["hallucination_info"]["correction"] = text_to_analyze
-
+            else: # Supported
+                analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
+                analysis_results["hallucination_info"]["correction"] = text_to_analyze
 
         except Exception as e:
-            print(f"Error during hallucination check with Gemini: {e}")
-            analysis_results["hallucination_info"]["reason"] = f"Error during factual verification: {str(e)}. Cannot definitively verify."
-    else:
-        analysis_results["hallucination_info"]["reason"] = "No RAG system (Wikipedia or Google Search) initialized. Cannot perform factual verification."
+            print(f"Error during RAG verification with Gemini: {e}")
+            analysis_results["hallucination_info"]["reason"] = f"Error during RAG verification: {str(e)}. Cannot definitively verify."
     # --- END HALLUCINATION CHECK ---
 
 
