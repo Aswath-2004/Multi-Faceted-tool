@@ -5,20 +5,20 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-import google.generativeai as genai
-# We will catch the generic 'Exception' in the retry logic for robustness.
-
-# Using a standard Wikipedia Retriever for verification context retrieval only
-from langchain_community.retrievers import WikipediaRetriever 
-# NEW: Import PubMedRetriever for scientific verification
-from langchain_community.retrievers import PubMedRetriever
-# NEW: Import Google Search API Wrapper
-from langchain_community.utilities import GoogleSearchAPIWrapper
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage
-
+# --- PII Verification Tools ---
+import phonenumbers
+import dns.resolver
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
+
+# --- RAG/LLM Tools ---
+import google.generativeai as genai
+from langchain_community.utilities import GoogleSearchAPIWrapper
+from langchain_community.retrievers import WikipediaRetriever, PubMedRetriever 
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate 
+from langchain_core.messages import SystemMessage
+
 
 print(f"Current working directory: {os.getcwd()}")
 
@@ -28,7 +28,7 @@ if os.path.exists(dotenv_path):
     load_success = load_dotenv(dotenv_path)
     print(f"load_dotenv() success: {load_success}")
 else:
-    print(f".env file NOT found at: {dotenv_path}")
+    print(f"I'm sorry, I cannot start the application. The .env file was NOT found at: {dotenv_path}")
     print("Please ensure your .env file is in the same directory as app.py")
 
 
@@ -36,85 +36,61 @@ app = Flask(__name__)
 CORS(app)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# NEW: Ensure Google Search API Key is loaded
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 print(f"Value of GEMINI_API_KEY from environment: '{GEMINI_API_KEY}'")
-# Note: Google Search requires both GOOGLE_CSE_ID and GOOGLE_API_KEY 
-if not (GOOGLE_CSE_ID and GOOGLE_API_KEY):
-    print("WARNING: GOOGLE_CSE_ID and/or GOOGLE_API_KEY are not set. Google Search grounding will be unavailable for analysis.")
 
 if not GEMINI_API_KEY:
-    # This print statement helps debug if the key is missing in the environment
     print("WARNING: GEMINI_API_KEY is not set. API calls will likely fail.")
 else:
     genai.configure(api_key=GEMINI_API_KEY)
 
 
-# CRITICAL FIX: Ensure the API key is correctly passed to the ChatGoogleGenerativeAI models.
-# Using gemini-2.5-flash for main chat and analysis
+# --- RAG & LLM SETUP ---
 chat_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7, google_api_key=GEMINI_API_KEY)
-# We use a *higher* temperature for the correction model to allow better synthesis
-correction_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, google_api_key=GEMINI_API_KEY)
-# The analysis model remains low-temp for reliability in RAG processing
 analysis_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=GEMINI_API_KEY)
-
-# A separate model instance for quick intent classification (low temperature for reliability)
+correction_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=GEMINI_API_KEY)
 intent_classifier_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1, google_api_key=GEMINI_API_KEY)
 
 
-# Global variables
-# Initialization for Wikipedia Retriever
+# --- RAG RETRIEVER SETUP (Multi-Source Context) ---
 try:
-    # INCREASED top_k_results from 3 to 5 for better coverage
     wiki_retriever = WikipediaRetriever(top_k_results=5, doc_content_chars_max=8000) 
-    print("WikipediaRetriever initialized for analysis.")
-except Exception as e:
-    print(f"Error initializing WikipediaRetriever: {e}")
-    wiki_retriever = None
-
-# NEW: Initialization for PubMed Retriever
-try:
-    pubmed_retriever = PubMedRetriever(top_k_results=3, doc_content_chars_max=8000) 
-    print("PubMedRetriever initialized for scientific analysis.")
-except Exception as e:
-    print(f"Error initializing PubMedRetriever: {e}")
+    
     pubmed_retriever = None
+    try:
+        pubmed_retriever = PubMedRetriever(top_k_results=3, doc_content_chars_max=8000)
+    except ImportError:
+        print(f"WARNING: PubMed Retriever failed to initialize. Scientific checks disabled.")
 
-# NEW: Initialization for Google Search Retriever
-try:
-    if GOOGLE_CSE_ID and GOOGLE_API_KEY:
-        # Note: LangChain uses environment variables for Google Search
-        search_wrapper = GoogleSearchAPIWrapper(k=3) # Retrieve up to 3 results
-        print("GoogleSearchAPIWrapper initialized for analysis.")
-    else:
-        search_wrapper = None
-        print("Google Search is disabled due to missing GOOGLE_CSE_ID or GOOGLE_API_KEY.")
+    google_search_wrapper = GoogleSearchAPIWrapper(k=5)
+    print("Multi-source RAG retrievers initialized.")
 except Exception as e:
-    print(f"Error initializing GoogleSearchAPIWrapper: {e}")
-    search_wrapper = None
+    print(f"Error initializing RAG retrievers: {e}")
+    wiki_retriever = None
+    pubmed_retriever = None
+    google_search_wrapper = None
 
+# --- PII & NLP SETUP ---
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
 
 # System prompt for intent classification
 CLASSIFIER_SYSTEM_PROMPT = SystemMessage(
     content="You are a system that classifies user queries. Respond with ONLY ONE word: 'FACTUAL' if the query requires external knowledge retrieval (e.g., questions about history, science, specific people, or concepts), or 'CONVERSATIONAL' if it is a simple greeting, short command, compliment, or small talk."
 )
 
-
-analyzer = AnalyzerEngine()
-anonymizer = AnonymizerEngine()
-
-# Example sets for non-sensitive data (Kept for compatibility)
-NON_SENSITIVE_LOCATIONS = {
-    "paris", "london", "tokyo", "new york", "mumbai", "chennai"
-}
-NON_SENSITIVE_NAMES = {
-    "john", "jane", "alex", "michael"
+# --- CONFIG: Adjust PII base risk for non-critical entities ---
+BASE_RISK_ADJUSTMENTS = {
+    "DATE_TIME": -0.45, 
+    "NRP": -0.35,       
 }
 
+# --- NEW: Public Data Type Exception List ---
+PUBLIC_DATA_EXCEPTIONS = ["DATE_TIME", "NRP", "LOCATION"]
 
-# --- NEW FUNCTION FOR API RETRY LOGIC (EXPONENTIAL BACKOFF) ---
+
+# --- HELPER FUNCTIONS ---
+
 def invoke_with_retry(model, prompt, max_retries=3, tools=None):
     """Invokes the LangChain model with exponential backoff on errors."""
     for attempt in range(max_retries):
@@ -124,18 +100,174 @@ def invoke_with_retry(model, prompt, max_retries=3, tools=None):
             else:
                 return model.invoke(prompt)
         except Exception as e:
-            # Catch all exceptions (API errors, connection issues, invalid arguments) for robust retrying
             error_type = "API/Connection Error"
             print(f"{error_type} (Attempt {attempt + 1}/{max_retries}): {e}")
             if attempt + 1 == max_retries:
-                # Re-raise on the last attempt
                 raise
-            # Exponential backoff: 2^attempt seconds
             wait_time = 2 ** attempt
-            print(f"Waiting for {wait_time} seconds before retrying...")
             time.sleep(wait_time)
-# --- END NEW FUNCTION ---
 
+
+def check_wikipedia_for_public_figure(name):
+    """
+    Uses Google Search to check for a high-confidence Wikipedia link for a name, 
+    first using the full name, then falling back to the last name.
+    """
+    if not google_search_wrapper:
+        return False
+    
+    name_parts = name.split()
+    search_terms = [name] # Try full name first
+    
+    if len(name_parts) > 1:
+        # Add the last name as a reliable fallback search term (e.g., 'Dhoni')
+        search_terms.append(name_parts[-1]) 
+    
+    for term in search_terms:
+        search_query = f'"{term}" wikipedia'
+        print(f"Checking Public Figure status for: {search_query}")
+        
+        try:
+            results = google_search_wrapper.results(search_query, num_results=3)
+            
+            for result in results:
+                # Look for a Wikipedia link that also contains the search term in the title
+                if 'wikipedia.org' in result.get('link', '').lower():
+                    if term.lower() in result.get('title', '').lower():
+                        print(f"Public Figure Check: Found strong Wikipedia match for {name} via term '{term}'.")
+                        return True
+        except Exception as e:
+            print(f"Error during Google Search public figure check: {e}")
+            # Do not return False here; continue to the next search term
+            
+    return False
+
+
+def verify_pii_entity(text, entity, analysis_model):
+    """
+    Performs external checks (MX, Phone, LLM context, Public Figure) on a detected PII entity
+    and calculates a risk score (0-1).
+    """
+    ent_text = text[entity.start:entity.end]
+    ent_type = entity.entity_type
+    
+    signals = {}
+
+    # --- Pre-Verification Filter (Removes Noise) ---
+    if len(ent_text.split()) == 1 and len(ent_text) < 4:
+         return None 
+    
+    # --- 1. External Validity Checks ---
+    if ent_type == "PHONE_NUMBER":
+        try:
+            pn = phonenumbers.parse(ent_text, None)
+            signals["phone_is_valid"] = phonenumbers.is_valid_number(pn)
+        except Exception:
+            signals["phone_is_valid"] = False
+
+    if ent_type == "EMAIL_ADDRESS":
+        try:
+            domain = ent_text.split("@")[-1]
+            dns.resolver.resolve(domain, "MX")
+            signals["domain_check_mx"] = True
+        except Exception:
+            signals["domain_check_mx"] = False
+
+    if ent_type == "PERSON":
+        signals["public_figure"] = check_wikipedia_for_public_figure(ent_text)
+
+    # --- 2. Contextual LLM Confirmation ---
+    try:
+        context = text[max(0, entity.start-50):min(len(text), entity.end+50)]
+        
+        llm_prompt = f"""
+        You are a privacy expert. Evaluate the following entity within its context.
+        Entity Type: {ent_type}
+        Entity Value: "{ent_text}"
+        Context Snippet: "...{context}..."
+
+        Answer the question: Does this entity, in this specific context, represent **Personally Identifiable Information (PII)** that could identify a private individual?
+        Respond ONLY with 'YES' or 'NO' followed by a one-sentence reason.
+        """
+        
+        llm_resp = invoke_with_retry(analysis_model, llm_prompt).content
+        
+        signals["llm_confirmed_pii"] = "yes" in llm_resp.lower()
+        signals["llm_reason"] = llm_resp.strip()
+    except Exception as e:
+        print(f"LLM PII context check failed: {e}")
+        signals["llm_confirmed_pii"] = False
+        signals["llm_reason"] = "LLM check failed due to API error."
+
+    # --- 3. Score Calculation ---
+    score = entity.score 
+    
+    score += BASE_RISK_ADJUSTMENTS.get(ent_type, 0)
+
+    if signals.get("phone_is_valid"): score += 0.15
+    if signals.get("domain_check_mx"): score += 0.10
+    if signals.get("llm_confirmed_pii"): score += 0.25 
+
+    # FIX: Increased penalty to -0.25 to successfully push public figures into the MEDIUM category.
+    if signals.get("public_figure") and ent_type == "PERSON": score -= 0.25 
+    
+    # Normalize to 0-1 range
+    final_score = min(max(score, 0), 1)
+    
+    verdict = "HIGH" if final_score > 0.7 else ("MEDIUM" if final_score > 0.4 else "LOW")
+
+    return {
+        "entity": ent_text,
+        "type": ent_type,
+        "presidio_score": f"{entity.score:.2f}", 
+        "risk_score": f"{final_score:.2f}",
+        "verdict": verdict,
+        "signals": signals,
+        # Required for matching in the main analyze function
+        "start_index": entity.start,
+        "end_index": entity.end
+    }
+
+def custom_redact_pii(text, pii_details, bot_text_start_index):
+    """
+    Manually redacts PII based on verified details, avoiding Presidio's anonymize() method.
+    """
+    
+    # Sort details by start index, descending, to avoid messing up indices of subsequent entities
+    sorted_details = sorted(pii_details, key=lambda x: x['start_index'], reverse=True)
+    
+    modified_text = list(text) # Convert string to list of characters for mutable modification
+
+    for detail in sorted_details:
+        start_index = detail['start_index']
+        end_index = detail['end_index']
+        entity_type = detail['type']
+        
+        # Check if the entity is a public figure that should NOT be redacted
+        is_public_figure = detail['signals'].get('public_figure') and detail['type'] == 'PERSON'
+        
+        # Check if the entity is high risk and should be masked
+        is_high_risk = detail['verdict'] == 'HIGH'
+        
+        # NEW FIX: Check if the entity is a public data type (Date, NRP, Location)
+        is_public_data_type = entity_type in PUBLIC_DATA_EXCEPTIONS
+
+        # Rule: Only redact if it's HIGH risk OR if it's NOT a public person AND NOT public data.
+        if is_high_risk or (not is_public_figure and not is_public_data_type): 
+            
+            # Use the mask replacement for generic sensitive data
+            replacement_tag = f"<{entity_type}>"
+            
+            # Replace the segment in the list
+            modified_text[start_index:end_index] = list(replacement_tag)
+            
+    # Reconstruct the string and trim the separator and user query if present
+    final_text = "".join(modified_text)
+    
+    return final_text[bot_text_start_index:].strip()
+
+
+# --- FLASK ROUTES ---
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -147,83 +279,59 @@ def chat():
         return jsonify({"error": "No message provided"}), 400
         
     try:
-        # --- 1. INTENT CLASSIFICATION ---
+        # --- 1. SPECIAL PII INJECTION MODE FOR TESTING ---
+        if "generate pii" in user_message.lower():
+            bot_response_text = f"""
+            PII Test Data Block:
+            Full Name: Elias Vance (DOB: 05/15/1988)
+            Email: elias.vance@examplecorp.net
+            Phone Number: +1-555-867-5309
+            Address: 742 Evergreen Terrace, Springfield, OR 97477
+            SSN (Fake): 900-01-0001
+            """
+            return jsonify({"response": bot_response_text})
+
+        # --- 2. INTENT CLASSIFICATION ---
         print(f"Classifying intent for: '{user_message}'")
         
-        # Use retry logic for classification
         classification_response_raw = invoke_with_retry(
             intent_classifier_model, 
             [CLASSIFIER_SYSTEM_PROMPT, user_message]
         ).content
         
         classification_response = classification_response_raw.strip().upper()
-
         is_factual_query = (classification_response == "FACTUAL")
         print(f"Intent classified as: {classification_response}")
         
-        bot_response_text = ""
+        # --- 3. CONSTRUCT CHAT RESPONSE (Gemini with Google Search Grounding) ---
         
-        # --- NEW CHECK FOR SPECULATIVE/INTERNAL KNOWLEDGE ONLY MODE ---
-        is_speculative_mode = "internal knowledge only" in user_message.lower()
-        if is_speculative_mode:
-            is_factual_query = True # Treat as factual, but use special prompt
-            print("Detected 'internal knowledge only' mode.")
-        # --- END NEW CHECK ---
+        system_instruction = "You are a helpful, professional, and concise assistant. Use Google Search to answer factual questions based on the latest information available."
         
-        if is_factual_query:
-            
-            # --- Setup Prompt based on mode ---
-            if is_speculative_mode:
-                # Option A: Speculative / internal knowledge only
-                system_instruction = "You are an assistant answering strictly from your own internal knowledge. Do NOT fetch anything externally. If you are unsure, provide your best plausible answer and label it as [SPECULATIVE]. Be professional and concise."
-            else:
-                # Default Factual Mode: Use direct LLM call with Google Search Grounding
-                system_instruction = "You are a helpful, professional, and concise assistant. Use Google Search to answer factual questions based on the latest information available."
-            
-            # Construct the chat history/prompt including system instructions
-            prompt_with_history = [
-                SystemMessage(content=system_instruction),
-                user_message
-            ]
+        prompt_with_history = [
+            SystemMessage(content=system_instruction),
+            user_message
+        ]
 
-            # Use retry logic for main chat model. Rely on the model's 
-            # inherent ability to use search tools for factual queries.
-            direct_response = invoke_with_retry(
-                chat_model,
-                prompt_with_history,
-            )
-            
-            bot_response_text = direct_response.content.strip()
-            
-        else:
-            # --- CONVERSATIONAL QUERY: Use direct LLM call ---
-            # Define a standard conversational prompt for simple queries
-            conversational_prompt = SystemMessage(
-                content="You are a helpful and brief conversational assistant. Respond naturally and concisely to greetings or simple small talk. Do not retrieve external information."
-            )
-            
-            # Use retry logic for conversational response
-            direct_response = invoke_with_retry(
-                chat_model,
-                [conversational_prompt, user_message]
-            )
-            
-            bot_response_text = direct_response.content.strip()
+        direct_response = invoke_with_retry(
+            chat_model,
+            prompt_with_history,
+        )
+        
+        bot_response_text = direct_response.content.strip()
 
         return jsonify({"response": bot_response_text})
 
     except Exception as e:
         print(f"Error during chat processing: {e}")
-        # Return a more descriptive error in the response
-        return jsonify({"error": "Failed to get response from AI model. Check if GEMINI_API_KEY is valid and network connectivity.", "details": str(e)}), 500
+        return jsonify({"error": "Failed to get response from AI model. Check configuration.", "details": str(e)}), 500
 
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
     data = request.get_json()
-    text_to_analyze = data.get('text')
-    original_user_query = data.get('user_query', '').lower() # Convert to lower case for easy matching
-
+    text_to_analyze = data.get('text')  # Bot's response
+    original_user_query = data.get('user_query', '') 
+    
     if not text_to_analyze:
         return jsonify({"error": "No text provided for analysis"}), 400
 
@@ -232,7 +340,6 @@ def analyze():
         "hallucination_info": {
             "detected": False,
             "reason": "N/A",
-            "location": "N/A",
             "correction": "N/A"
         },
         "pii_info": {
@@ -241,226 +348,213 @@ def analyze():
             "refined_text": text_to_analyze
         }
     }
+    
+    # --- 1. INTENT CLASSIFICATION (Rerunning on User Query for Analysis Flow) ---
+    try:
+        classification_response_raw = invoke_with_retry(
+            intent_classifier_model, 
+            [CLASSIFIER_SYSTEM_PROMPT, original_user_query]
+        ).content
+        classification_response = classification_response_raw.strip().upper()
+        is_factual_query = (classification_response == "FACTUAL")
+    except Exception as e:
+        print(f"Intent classification failed during analysis: {e}. Assuming Factual.")
+        is_factual_query = True
 
-    # --- ENHANCEMENT: Check for PII request in the user query regardless of chatbot response ---
-    if re.search(r"phone number|contact number", original_user_query):
-        analysis_results["pii_info"]["detected"] = True
-        analysis_results["hallucination_info"]["detected"] = True # Flag as violation
-        analysis_results["hallucination_info"]["reason"] = "Policy Violation Detected: The original query explicitly requested sensitive Personally Identifiable Information (PII), such as a phone number. Generating or searching for such private data is strictly prohibited by our policy."
-        analysis_results["hallucination_info"]["correction"] = "This query falls under the policy violation category and should be flagged regardless of the chatbot's response."
-        analysis_results["pii_info"]["details"].append({"message": "Query requested Phone Number (Policy Violation)." })
-        # We can return immediately since the policy check takes precedence
-        return jsonify(analysis_results)
-    # --- END ENHANCEMENT ---
-
-
-    # --- PII DETECTION: Only Phone Numbers in Chatbot Response ---
-    initial_pii_analysis = analyzer.analyze(text=text_to_analyze, language="en", score_threshold=0.6)
-
-    final_pii_results = []
-    for result in initial_pii_analysis:
-        # Only check for phone numbers as PII, as requested
-        if result.entity_type == "PHONE_NUMBER":
-            final_pii_results.append(result)
-
-    if final_pii_results:
-        # PII Detected logic (Enhanced messaging)
-        analysis_results["pii_info"]["detected"] = True
-        
-        # Set a specific message for PII reason
-        analysis_results["hallucination_info"]["detected"] = True # Flag as violation
-        analysis_results["hallucination_info"]["reason"] = "Privacy Violation Detected: The statement contains sensitive Personally Identifiable Information (PII) like phone numbers, which should not be generated or shared as per our privacy policy."
-        analysis_results["hallucination_info"]["correction"] = "Sensitive content was removed to comply with privacy policies."
-
-        pii_details = []
-        for entity in final_pii_results:
-            pii_details.append({
-                "type": entity.entity_type,
-                "value": text_to_analyze[entity.start:entity.end],
-                "location": f"Chars {entity.start}-{entity.end}",
-                "score": f"{entity.score:.2f}"
-            })
-        analysis_results["pii_info"]["details"] = pii_details
-
-        anonymized_result = anonymizer.anonymize(text=text_to_analyze, analyzer_results=final_pii_results)
-        analysis_results["pii_info"]["refined_text"] = anonymized_result.text
-
-        # If PII is detected, we return immediately and skip the factual hallucination check
-        return jsonify(analysis_results)
+    # --- 2. PII DETECTION RUNS ON COMBINED TEXT (User Query + Bot Response) ---
+    
+    # Combined text is used for accurate PII detection across the conversation context
+    SEPARATOR = " |::SEPARATOR::| " 
+    if original_user_query and original_user_query not in text_to_analyze:
+        pii_detection_text = f"{original_user_query}{SEPARATOR}{text_to_analyze}"
     else:
-        analysis_results["pii_info"]["details"].append({"message": "No PII (only Phone Numbers checked) detected."})
-    # --- END PII DETECTION ---
-
-    # --- HALLUCINATION CHECK: Three-tiered verification for context ---
-    
-    # 1. Start RAG process
-    search_query = original_user_query 
-    context_parts = []
-    
-    # Fetch Google Search context FIRST (most robust, provides snippets)
-    if search_wrapper:
-        print("Fetching context from Google Search...")
-        search_results = search_wrapper.results(search_query, 3) 
+        pii_detection_text = text_to_analyze
         
-        found_wiki_snippet = False
-        search_context = []
-        for res in search_results:
-            snippet = res.get('snippet', 'N/A')
-            title = res.get('title', 'N/A')
-            source = res.get('source', '')
-            search_context.append(f"Source: {title} ({source})\nSnippet: {snippet}")
-            
-            if 'wikipedia.org' in source.lower():
-                found_wiki_snippet = True
-                
-        if search_context:
-            context_parts.append(f"--- GOOGLE SEARCH CONTEXT ---\n" + "\n".join(search_context))
+    separator_index = pii_detection_text.find(SEPARATOR)
+    bot_text_start_index_in_combined = separator_index + len(SEPARATOR) if separator_index != -1 else 0
 
+    # PII Detection (using Presidio on combined text)
+    initial_pii_analysis = analyzer.analyze(text=pii_detection_text, language="en", score_threshold=0.6)
     
-    # Fetch Wikipedia context: ONLY RUN if Google didn't give us a direct Wikipedia snippet
-    if wiki_retriever and not found_wiki_snippet: 
-        print("Fetching context from Wikipedia (Fallback)...")
-        try:
-            retrieved_wiki_docs = wiki_retriever.invoke(search_query)
-            wiki_context = "\n".join([doc.page_content for doc in retrieved_wiki_docs])
-            if wiki_context:
-                context_parts.append(f"--- WIKIPEDIA CONTEXT ---\n{wiki_context}")
-        except Exception as e:
-            print(f"Error during Wikipedia retrieval: {e}")
+    pii_types_to_verify = ["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS", "DATE_TIME", "CREDIT_CARD", "NRP", "SSN", "ADDRESS"]
+    
+    pii_entities_in_bot_response_space = []
+    high_risk_detected = False
 
-    # Fetch PubMed context
-    if pubmed_retriever:
-        print("Fetching context from PubMed...")
-        try:
-            retrieved_pubmed_docs = pubmed_retriever.invoke(search_query)
-            pubmed_context = "\n".join([f"Title: {doc.metadata.get('Title', 'N/A')}\nAbstract: {doc.page_content}" for doc in retrieved_pubmed_docs])
-            if pubmed_context:
-                context_parts.append(f"--- PUBMED CONTEXT ---\n{pubmed_context}")
-        except Exception as e:
-            print(f"Error during PubMed retrieval: {e}")
-            
-    
-    context_for_verification = "\n\n".join(context_parts)
-    
-    # --- 2. Verification Logic ---
-    if not context_for_verification.strip():
-        # Fallback 1: If RAG provides NO context, use the LLM's native Google Search tool for a definitive answer.
-        print("RAG failed to find context. Invoking LLM Search Grounding for correction...")
+    for entity in initial_pii_analysis:
+        if entity.entity_type not in pii_types_to_verify:
+            continue
         
-        # System instruction to force the LLM to search for the corrected information
-        correction_prompt = SystemMessage(
-            content=f"The statement to be verified is: '{text_to_analyze}'. The RAG system found no context. Use Google Search to find the most accurate factual correction or replacement statement for this topic. Respond ONLY with the corrected statement."
+        # Filter out short/fragmented entities before costly verification
+        entity_text_full = pii_detection_text[entity.start:entity.end]
+        if len(entity_text_full.split()) == 1 and len(entity_text_full) < 4:
+            continue
+
+        # PII Verification (LLM, MX, Phone Validity, Public Figure)
+        verified_data = verify_pii_entity(pii_detection_text, entity, analysis_model)
+        
+        if verified_data is not None:
+            pii_entities_in_bot_response_space.append(verified_data)
+
+            if verified_data['verdict'] == 'HIGH':
+                high_risk_detected = True
+
+    
+    analysis_results["pii_info"]["details"] = pii_entities_in_bot_response_space
+
+    if analysis_results["pii_info"]["details"]:
+        analysis_results["pii_info"]["detected"] = True
+
+        # 3. PII Redaction: Using manual string manipulation (THE STABLE FIX)
+        
+        # Use the custom function to redact PII and clean up the separator
+        refined_text = custom_redact_pii(
+            pii_detection_text,
+            pii_entities_in_bot_response_space,
+            bot_text_start_index_in_combined
         )
         
-        # Use retry logic with the correction model and tools enabled
-        try:
-            native_search_response = invoke_with_retry(
-                correction_model,
-                [correction_prompt],
-                tools=[{"google_search": {}}]
-            ).content.strip()
+        analysis_results["pii_info"]["refined_text"] = refined_text
 
+        
+        # 4. Set PII Hallucination/Policy Flag
+        analysis_results["hallucination_info"]["detected"] = high_risk_detected
+        if high_risk_detected:
+            analysis_results["hallucination_info"]["reason"] = "Policy Violation Detected: The statement contains high-risk Personally Identifiable Information (PII). Sharing private data is strictly prohibited by our policy."
+            analysis_results["hallucination_info"]["correction"] = analysis_results["pii_info"]["refined_text"]
+        else:
+            analysis_results["hallucination_info"]["reason"] = "PII detected but risk is medium/low. Redaction was applied for sensitive types."
+
+        if high_risk_detected:
+            return jsonify(analysis_results)
+    
+    # --- 3. RAG-BASED HALLUCINATION CHECK (Only runs if Factual and no HIGH-RISK PII was found) ---
+    if not is_factual_query:
+        analysis_results["hallucination_info"]["detected"] = False
+        analysis_results["hallucination_info"]["reason"] = "Skipping factual check: User query was classified as CONVERSATIONAL."
+        analysis_results["hallucination_info"]["correction"] = text_to_analyze
+        return jsonify(analysis_results)
+
+
+    search_query = original_user_query
+    
+    if wiki_retriever or pubmed_retriever or google_search_wrapper:
+        print(f"Fetching context for verification using query: '{search_query}'")
+        
+        context_for_verification = ""
+        
+        # 1. Google Search Context (Best for real-time/niche)
+        if google_search_wrapper:
+            try:
+                print("Fetching context from Google Search...")
+                google_results = google_search_wrapper.results(search_query, num_results=5)
+                google_context = "\n".join([f"Source: {r.get('title', 'N/A')}\nSnippet: {r.get('snippet', 'N/A')}" for r in google_results])
+                context_for_verification += "--- GOOGLE SEARCH CONTEXT ---\n" + google_context + "\n"
+            except Exception as e:
+                print(f"Google Search retrieval failed: {e}")
+                
+        # 2. Wikipedia Context (Structured general knowledge)
+        if wiki_retriever:
+            try:
+                print("Fetching context from Wikipedia...")
+                wiki_docs = wiki_retriever.invoke(search_query)
+                wiki_context = "\n".join([doc.page_content for doc in wiki_docs])
+                context_for_verification += "--- WIKIPEDIA CONTEXT ---\n" + wiki_context + "\n"
+            except Exception as e:
+                print(f"Wikipedia retrieval failed: {e}")
+
+        # 3. PubMed Context (Scientific/Medical authority)
+        if pubmed_retriever:
+            try:
+                print("Fetching context from PubMed...")
+                pubmed_docs = pubmed_retriever.invoke(search_query)
+                pubmed_context = "\n".join([doc.page_content for doc in pubmed_docs])
+                context_for_verification += "--- PUBMED CONTEXT ---\n" + pubmed_context + "\n"
+            except Exception as e:
+                print(f"PubMed retrieval failed: {e}")
+
+        if not context_for_verification.strip():
+            # If ALL retrievers fail to find context
             analysis_results["hallucination_info"]["detected"] = True
-            analysis_results["hallucination_info"]["reason"] = "RAG context failure detected. Correction provided via internal LLM search tool for robustness."
-            analysis_results["hallucination_info"]["correction"] = native_search_response
+            analysis_results["hallucination_info"]["reason"] = "Unverifiable Factual Claim: No external context could be retrieved to verify this statement."
+            analysis_results["hallucination_info"]["correction"] = "No external context was found to support this claim."
+        else:
+            # 4. Use LLM to Verify Statement against Context
+            verification_prompt = f"""
+            Given the following factual context retrieved from multiple sources (Wikipedia, Google Search, PubMed):
+            ---
+            {context_for_verification}
+            ---
+            Evaluate the following statement: "{text_to_analyze}"
+            Does this statement align with, contradict, or is it not mentioned in the provided context?
+            If it contradicts, explain why and provide the correct information from the context. If it is Not Mentioned, state why.
             
-        except Exception as e:
-             # If the LLM search tool also fails
-            analysis_results["hallucination_info"]["detected"] = True
-            analysis_results["hallucination_info"]["reason"] = "Verification system failure: Both RAG and LLM Search failed to retrieve context. Cannot definitively verify."
-            analysis_results["hallucination_info"]["correction"] = "Final system error: Cannot provide a definitive correction."
+            Provide your answer in a structured format:
+            Verification: [Supported/Contradicted/Not Mentioned]
+            Reasoning: [Explanation]
+            Correction/Refinement: [Corrected statement if applicable, or 'N/A']
+            """
+            
+            print(f"Sending verification prompt to Gemini...")
+            
+            try:
+                verification_response = invoke_with_retry(analysis_model, verification_prompt)
+                verification_text = verification_response.content
+            except Exception as e:
+                print(f"Error during Gemini verification step: {e}")
+                verification_text = "Verification: Not Mentioned\nReasoning: LLM verification failed.\nCorrection/Refinement: N/A"
 
-
-    else:
-        # Fallback 2: If RAG HAS context, proceed with standard verification
-        verification_prompt = f"""
-        Given the following factual context retrieved from multiple sources (Wikipedia, Google Search, PubMed):
-        ---
-        {context_for_verification}
-        ---
-        Evaluate the following statement: "{text_to_analyze}"
-        Does this statement align with, contradict, or is it not mentioned in the provided context?
-        If it contradicts or is not mentioned, explain why. If it is Contradicted, or Not Mentioned but likely false, provide the most plausible correction from the provided context or state that a correction cannot be given.
-        Provide your answer in a structured format:
-        Verification: [Supported/Contradicted/Not Mentioned]
-        Reasoning: [Explanation]
-        Correction/Refinement: [Corrected statement if applicable, or 'N/A']
-        """
-        
-        print(f"Sending verification prompt to Gemini:\n{verification_prompt}")
-        
-        try:
-            # Use retry logic for analysis/verification model
-            verification_response = invoke_with_retry(analysis_model, verification_prompt)
-            verification_text = verification_response.content
-
+            # 5. Extract results from Gemini's structured response
             verification_status = "Unknown"
-            reasoning = "N/A"
+            reasoning = "LLM response parsing failed."
             correction = "N/A"
 
-            # Use re.DOTALL to ensure multiline match if Gemini's response spans multiple lines
-            if "Verification: Supported" in verification_text:
-                verification_status = "Supported"
-            elif "Verification: Contradicted" in verification_text:
-                verification_status = "Contradicted"
-            elif "Verification: Not Mentioned" in verification_text:
-                verification_status = "Not Mentioned"
-            
-            # Extract Reasoning (single line)
-            reasoning_match = re.search(r"Reasoning: (.+)", verification_text)
+            status_match = re.search(r"Verification:\s*(.+)", verification_text)
+            reasoning_match = re.search(r"Reasoning:\s*(.+)", verification_text)
+            correction_match = re.search(r"Correction/Refinement:\s*(.+)", verification_text)
+
+            if status_match:
+                verification_status = status_match.group(1).strip()
             if reasoning_match:
                 reasoning = reasoning_match.group(1).strip()
-            
-            # Extract Correction/Refinement (potentially multi-line)
-            correction_match = re.search(r"Correction/Refinement: (.+)", verification_text, re.DOTALL)
             if correction_match:
                 correction = correction_match.group(1).strip()
 
-
-            # Handle logic for setting final results
             analysis_results["hallucination_info"]["detected"] = (verification_status == "Contradicted" or verification_status == "Not Mentioned")
-            
-            if analysis_results["hallucination_info"]["detected"]:
-                analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
-                
-                # If Gemini provided a correction, use it.
-                if correction != 'N/A':
-                    analysis_results["hallucination_info"]["correction"] = correction
-                
-                # --- CRITICAL FIX: IF CONTRADICTED BUT NO CORRECTION, FORCE NATIVE SEARCH ---
-                elif verification_status == "Contradicted":
-                    print("Contradiction detected but no structured correction found. Forcing native LLM search correction.")
+            analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
+            analysis_results["hallucination_info"]["correction"] = correction if correction != 'N/A' else (text_to_analyze if verification_status == "Supported" else "N/A")
+
+            # 6. Fallback Search for Correction (If Contradicted but correction failed)
+            if verification_status == "Contradicted" and (correction == "N/A" or correction == analysis_results["hallucination_info"]["correction"] == "N/A"):
+                print("Contradiction detected, but correction failed. Initiating native search for correction...")
+                try:
+                    correction_prompt = [
+                        SystemMessage(content="You are a meticulous fact-checker. Given that the user's previous statement was contradicted by evidence, your sole task is to perform a Google Search and provide the single, correct, factual statement that addresses the core topic. Do not include your reasoning or any fluff."),
+                        f"Provide the single correct, factual statement for: {text_to_analyze}"
+                    ]
                     
-                    # System instruction to force the LLM to search for the corrected information
-                    correction_prompt_contradicted = SystemMessage(
-                        content=f"The RAG system confirmed the statement to be verified ('{text_to_analyze}') is CONTRADICTED by the context. Find the single most accurate factual replacement or correction for this statement using Google Search. Respond ONLY with the corrected statement."
+                    correction_response = invoke_with_retry(
+                        correction_model,
+                        correction_prompt,
+                        tools=[{"google_search": {}}]
                     )
                     
-                    try:
-                        forced_correction = invoke_with_retry(
-                            correction_model,
-                            [correction_prompt_contradicted],
-                            tools=[{"google_search": {}}]
-                        ).content.strip()
-                        analysis_results["hallucination_info"]["correction"] = forced_correction
-                    except Exception:
-                        analysis_results["hallucination_info"]["correction"] = "Cannot provide a definitive correction without more context."
-                        
-                # If status is Not Mentioned, assume the statement is correct but unverified by RAG (e.g., future events) and set correction to original text for demonstration.
-                elif verification_status == "Not Mentioned":
-                        analysis_results["hallucination_info"]["correction"] = text_to_analyze
+                    final_correction = correction_response.content.strip()
+                    analysis_results["hallucination_info"]["correction"] = final_correction
+                except Exception as e:
+                    print(f"Final native search correction failed: {e}")
+                    analysis_results["hallucination_info"]["correction"] = "Cannot provide a definitive correction without more context."
+            
+            # Final check for Correction/Not Mentioned default
+            if analysis_results["hallucination_info"]["correction"] == "N/A":
+                 analysis_results["hallucination_info"]["correction"] = "Cannot provide a definitive correction without more context."
 
-            else: # Supported
-                analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
-                analysis_results["hallucination_info"]["correction"] = text_to_analyze
-
-        except Exception as e:
-            print(f"Error during RAG verification with Gemini: {e}")
-            analysis_results["hallucination_info"]["reason"] = f"Error during RAG verification: {str(e)}. Cannot definitively verify."
-    # --- END HALLUCINATION CHECK ---
+    else:
+        analysis_results["hallucination_info"]["reason"] = "RAG system not fully initialized. Cannot perform factual verification."
 
 
     return jsonify(analysis_results)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='127.0.0.1', port=5000, debug=True)
+    
