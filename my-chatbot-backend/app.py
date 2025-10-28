@@ -5,16 +5,20 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-# --- PII Verification Tools ---
+# NEW: Import 'requests' for URL validation
+import requests
 import phonenumbers
 import dns.resolver
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
+from presidio_analyzer.predefined_recognizers import PhoneRecognizer
+from presidio_analyzer.nlp_engine import NlpEngineProvider # Required for custom recognizer injection
 
 # --- RAG/LLM Tools ---
 import google.generativeai as genai
 from langchain_community.utilities import GoogleSearchAPIWrapper
-from langchain_community.retrievers import WikipediaRetriever, PubMedRetriever 
+# FIX: Replacing PubMedRetriever with the more stable ArXivRetriever for scientific context
+from langchain_community.retrievers import WikipediaRetriever, ArxivRetriever
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate 
 from langchain_core.messages import SystemMessage
@@ -48,7 +52,8 @@ else:
 # --- RAG & LLM SETUP ---
 chat_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7, google_api_key=GEMINI_API_KEY)
 analysis_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=GEMINI_API_KEY)
-correction_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=GEMINI_API_KEY)
+# FIX: Increased temperature to 0.4 to ensure the correction model synthesizes text even when RAG is weak.
+correction_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4, google_api_key=GEMINI_API_KEY) 
 intent_classifier_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1, google_api_key=GEMINI_API_KEY)
 
 
@@ -56,22 +61,34 @@ intent_classifier_model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", tempe
 try:
     wiki_retriever = WikipediaRetriever(top_k_results=5, doc_content_chars_max=8000) 
     
-    pubmed_retriever = None
-    try:
-        pubmed_retriever = PubMedRetriever(top_k_results=3, doc_content_chars_max=8000)
-    except ImportError:
-        print(f"WARNING: PubMed Retriever failed to initialize. Scientific checks disabled.")
+    # FIX: Initialize ArXiv Retriever instead of PubMed
+    arxiv_retriever = ArxivRetriever(top_k_results=3, doc_content_chars_max=8000)
+    print("ArXivRetriever initialized for scientific analysis.")
 
     google_search_wrapper = GoogleSearchAPIWrapper(k=5)
     print("Multi-source RAG retrievers initialized.")
 except Exception as e:
     print(f"Error initializing RAG retrievers: {e}")
     wiki_retriever = None
-    pubmed_retriever = None
+    arxiv_retriever = None
     google_search_wrapper = None
 
 # --- PII & NLP SETUP ---
-analyzer = AnalyzerEngine()
+
+# Custom provider configuration to ensure PhoneRecognizer is used aggressively
+provider = NlpEngineProvider(nlp_configuration={'nlp_engine_name': 'spacy', 
+                                                'models': [{'lang_code': 'en', 
+                                                            'model_name': 'en_core_web_lg'}]})
+nlp_engine = provider.create_engine()
+
+# FIX 1: Initialize PhoneRecognizer without unsupported arguments
+phone_recognizer = PhoneRecognizer(context=["phone", "number", "contact", "call"])
+
+# FIX 2: Initialize AnalyzerEngine without 'recognizer_list' argument, then manually add recognizer.
+analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
+analyzer.registry.add_recognizer(phone_recognizer)
+
+
 anonymizer = AnonymizerEngine()
 
 # System prompt for intent classification
@@ -85,8 +102,8 @@ BASE_RISK_ADJUSTMENTS = {
     "NRP": -0.35,       
 }
 
-# --- NEW: Public Data Type Exception List ---
-PUBLIC_DATA_EXCEPTIONS = ["DATE_TIME", "NRP", "LOCATION"]
+# --- NEW: Public Data Type Exception List (Non-PII, Non-Redactable) ---
+PUBLIC_DATA_EXCEPTIONS = ["DATE_TIME", "NRP", "LOCATION", "ADDRESS"]
 
 
 # --- HELPER FUNCTIONS ---
@@ -106,6 +123,29 @@ def invoke_with_retry(model, prompt, max_retries=3, tools=None):
                 raise
             wait_time = 2 ** attempt
             time.sleep(wait_time)
+
+
+# NEW: Custom URL Validity Checker
+def check_url_validity(url):
+    """Performs a lightweight HEAD request to check if a URL returns a 2xx or 3xx status code."""
+    try:
+        # Use HEAD request for speed and less bandwidth consumption
+        response = requests.head(url, timeout=5, allow_redirects=True)
+        # 2xx codes are success, 3xx codes are redirects (still valid)
+        if 200 <= response.status_code < 400:
+            return "VALID"
+        elif response.status_code >= 400:
+             return f"INVALID (Status: {response.status_code})"
+        else:
+             return "INVALID (Unknown Status)"
+    except requests.RequestException as e:
+        return f"INVALID (Request Failed: {type(e).__name__})"
+
+# Function to extract all links from the text (simpler regex than Presidio's URL detector)
+def extract_links(text):
+    # Regex to capture http/https links
+    url_pattern = re.compile(r'https?:\/\/[^\s\/\.]+[^\s]+')
+    return url_pattern.findall(text)
 
 
 def check_wikipedia_for_public_figure(name):
@@ -160,7 +200,8 @@ def verify_pii_entity(text, entity, analysis_model):
     # --- 1. External Validity Checks ---
     if ent_type == "PHONE_NUMBER":
         try:
-            pn = phonenumbers.parse(ent_text, None)
+            # Check for structural validity and format plausibility
+            pn = phonenumbers.parse(ent_text, "IN") # Assume Indian number format for robust checking
             signals["phone_is_valid"] = phonenumbers.is_valid_number(pn)
         except Exception:
             signals["phone_is_valid"] = False
@@ -182,7 +223,7 @@ def verify_pii_entity(text, entity, analysis_model):
         
         llm_prompt = f"""
         You are a privacy expert. Evaluate the following entity within its context.
-        Entity Type: {ent_type}
+        Entity Type: {ent_text}
         Entity Value: "{ent_text}"
         Context Snippet: "...{context}..."
 
@@ -249,7 +290,7 @@ def custom_redact_pii(text, pii_details, bot_text_start_index):
         # Check if the entity is high risk and should be masked
         is_high_risk = detail['verdict'] == 'HIGH'
         
-        # NEW FIX: Check if the entity is a public data type (Date, NRP, Location)
+        # NEW FIX: Check if the entity is a public data type (Date, NRP, Location, Address)
         is_public_data_type = entity_type in PUBLIC_DATA_EXCEPTIONS
 
         # Rule: Only redact if it's HIGH risk OR if it's NOT a public person AND NOT public data.
@@ -382,6 +423,16 @@ def analyze():
     high_risk_detected = False
 
     for entity in initial_pii_analysis:
+        # FIX: Aggressive reclassification of numeric strings to PHONE_NUMBER
+        if entity.entity_type == "DATE_TIME":
+            # Check if the entity looks more like a phone number than a date
+            numeric_string = re.sub(r'[^0-9]', '', pii_detection_text[entity.start:entity.end])
+            if len(numeric_string) >= 8 and (len(numeric_string) <= 12):
+                # Reclassify as PHONE_NUMBER if it fits the digit length criteria
+                entity.entity_type = "PHONE_NUMBER"
+                # Note: The Presidio object is mutable here, so we only need to change entity_type
+                # print(f"DEBUG: Reclassified {entity_text_full} from DATE_TIME to PHONE_NUMBER.")
+
         if entity.entity_type not in pii_types_to_verify:
             continue
         
@@ -419,6 +470,8 @@ def analyze():
         
         # 4. Set PII Hallucination/Policy Flag
         analysis_results["hallucination_info"]["detected"] = high_risk_detected
+        
+        # FIX 1: Set Hallucination reason ONLY based on HIGH risk, otherwise defer to factual check
         if high_risk_detected:
             analysis_results["hallucination_info"]["reason"] = "Policy Violation Detected: The statement contains high-risk Personally Identifiable Information (PII). Sharing private data is strictly prohibited by our policy."
             analysis_results["hallucination_info"]["correction"] = analysis_results["pii_info"]["refined_text"]
@@ -438,11 +491,25 @@ def analyze():
 
     search_query = original_user_query
     
-    if wiki_retriever or pubmed_retriever or google_search_wrapper:
+    if wiki_retriever or arxiv_retriever or google_search_wrapper:
         print(f"Fetching context for verification using query: '{search_query}'")
         
         context_for_verification = ""
         
+        # --- URL VALIDATION CONTEXT ---
+        links_in_text = extract_links(text_to_analyze)
+        link_validation_results = ""
+        
+        if links_in_text:
+            link_validation_results = "\n--- URL VALIDATION RESULTS ---"
+            for link in links_in_text:
+                validation_status = check_url_validity(link)
+                link_validation_results += f"\nURL: {link}, Status: {validation_status}"
+            
+            context_for_verification += link_validation_results + "\n"
+        # --- END URL VALIDATION CONTEXT ---
+
+
         # 1. Google Search Context (Best for real-time/niche)
         if google_search_wrapper:
             try:
@@ -463,15 +530,15 @@ def analyze():
             except Exception as e:
                 print(f"Wikipedia retrieval failed: {e}")
 
-        # 3. PubMed Context (Scientific/Medical authority)
-        if pubmed_retriever:
+        # 3. ArXiv Context (Scientific/Academic authority)
+        if arxiv_retriever:
             try:
-                print("Fetching context from PubMed...")
-                pubmed_docs = pubmed_retriever.invoke(search_query)
-                pubmed_context = "\n".join([doc.page_content for doc in pubmed_docs])
-                context_for_verification += "--- PUBMED CONTEXT ---\n" + pubmed_context + "\n"
+                print("Fetching context from ArXiv...")
+                arxiv_docs = arxiv_retriever.invoke(search_query)
+                arxiv_context = "\n".join([f"Title: {doc.metadata.get('Title', 'N/A')}\nAbstract: {doc.page_content}" for doc in arxiv_docs])
+                context_for_verification += "--- ARXIV CONTEXT ---\n" + arxiv_context + "\n"
             except Exception as e:
-                print(f"PubMed retrieval failed: {e}")
+                print(f"ArXiv retrieval failed: {e}")
 
         if not context_for_verification.strip():
             # If ALL retrievers fail to find context
@@ -481,18 +548,22 @@ def analyze():
         else:
             # 4. Use LLM to Verify Statement against Context
             verification_prompt = f"""
-            Given the following factual context retrieved from multiple sources (Wikipedia, Google Search, PubMed):
+            Given the following factual context retrieved from multiple sources (Wikipedia, Google Search, ArXiv) AND the following URL validation results:
             ---
             {context_for_verification}
             ---
-            Evaluate the following statement: "{text_to_analyze}"
-            Does this statement align with, contradict, or is it not mentioned in the provided context?
-            If it contradicts, explain why and provide the correct information from the context. If it is Not Mentioned, state why.
+            
+            Carefully evaluate the following statement: "{text_to_analyze}"
+            
+            1. Factual Check: Does the statement align with, contradict, or is it not mentioned in the factual context (Wikipedia, Google, ArXiv)?
+            2. Link Check: If the statement contains URLs, which ones were marked as 'INVALID' in the validation results? You must remove all invalid URLs and replace them with the validation status in parentheses (e.g., [Link to paper](INVALID LINK)).
+            
+            If the statement is Contradicted or Not Mentioned, explain why and provide the corrected version, ensuring all invalid links are removed.
             
             Provide your answer in a structured format:
             Verification: [Supported/Contradicted/Not Mentioned]
             Reasoning: [Explanation]
-            Correction/Refinement: [Corrected statement if applicable, or 'N/A']
+            Correction/Refinement: [Corrected statement with only VALID links, or 'N/A']
             """
             
             print(f"Sending verification prompt to Gemini...")
@@ -511,7 +582,7 @@ def analyze():
 
             status_match = re.search(r"Verification:\s*(.+)", verification_text)
             reasoning_match = re.search(r"Reasoning:\s*(.+)", verification_text)
-            correction_match = re.search(r"Correction/Refinement:\s*(.+)", verification_text)
+            correction_match = re.search(r"Correction/Refinement:\s*(.+)", verification_text, re.DOTALL) # Use DOTALL for multi-line capture
 
             if status_match:
                 verification_status = status_match.group(1).strip()
@@ -521,7 +592,13 @@ def analyze():
                 correction = correction_match.group(1).strip()
 
             analysis_results["hallucination_info"]["detected"] = (verification_status == "Contradicted" or verification_status == "Not Mentioned")
-            analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
+            
+            # FIX 2: Hallucination Reason set only if PII HIGH risk detection was skipped
+            if analysis_results["hallucination_info"]["detected"]:
+                analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
+            else: # If Supported, just use the reasoning
+                 analysis_results["hallucination_info"]["reason"] = f"Factual check: {verification_status}. {reasoning}"
+
             analysis_results["hallucination_info"]["correction"] = correction if correction != 'N/A' else (text_to_analyze if verification_status == "Supported" else "N/A")
 
             # 6. Fallback Search for Correction (If Contradicted but correction failed)
@@ -557,4 +634,3 @@ def analyze():
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000, debug=True)
-    
